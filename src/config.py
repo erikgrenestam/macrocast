@@ -12,7 +12,7 @@ class VariableSpec:
 
     internal_series_name: str
     aggregation: Literal['mean', 'sd', 'first', 'last'] = 'last'
-    transformation: Literal['none', 'log', 'diff', '12m_diff', 'log_diff'] = 'none'
+    transformation: Literal['none', 'log', 'diff', '12m_diff', 'log_diff', 'log_12m_diff'] = 'none'
     n_lags: int = 12
     publication_lag: int = 1
     fill_method: Optional[Literal['ffill', 'bfill', 'interpolate']] = None
@@ -23,9 +23,7 @@ class TargetSpec:
     """Specification for target variable."""
 
     internal_series_name: str
-    transformation: Literal['none', 'log', 'diff', '12m_diff', 'log_diff'] = 'none'
-    detrend: bool = False
-    detrend_method: Literal['linear', 'hp_filter', 'moving_average'] = 'linear'
+    transformation: Literal['none', 'log', 'diff', '12m_diff', 'log_diff', 'log_12m_diff'] = 'none'
 
 
 @dataclass

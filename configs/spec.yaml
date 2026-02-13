@@ -2,30 +2,29 @@
 
 target:
   internal_series_name: "hicp_dk_dst"
-  transformation: "12m_diff"  # 12-month inflation rate (year-over-year)
-  detrend: false              # Not needed for stationary transformation
+  transformation: "log_12m_diff"  # Log 12-month difference (year-over-year log change)
 
 features:
   # Domestic macroeconomic indicators
   - internal_series_name: "industrial_production_index_dk_dst"
     aggregation: "last"
     transformation: "12m_diff"
-    n_lags: 6
-    publication_lag: 2
+    n_lags: 3
+    publication_lag: 1
     fill_method: null
 
   - internal_series_name: "unemployment_rate_dk_eurostat"
     aggregation: "last"
     transformation: "diff"
-    n_lags: 12
+    n_lags: 3
     publication_lag: 1
     fill_method: null
 
   - internal_series_name: "central_gov_debt_dk"
     aggregation: "last"
     transformation: "log_diff"
-    n_lags: 4
-    publication_lag: 3
+    n_lags: 3
+    publication_lag: 1
     fill_method: "ffill"
 
   # Producer prices (leading indicator)
@@ -96,12 +95,12 @@ features:
     fill_method: null
 
 model:
-  n_trees: 50
-  n_chains: 4
-  n_cores: 4
+  n_trees: 200
+  n_chains: 6
+  n_cores: 6
   n_tune: 1000
   n_draws: 1000
-  horizons: [1, 3, 6, 12, 18, 24]
+  horizons: [6]
 
 backtest:
   method: "expanding"

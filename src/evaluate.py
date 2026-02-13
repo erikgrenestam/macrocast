@@ -217,8 +217,7 @@ class BacktestEngine:
     def _merge_actuals(self, forecasts_df: pd.DataFrame) -> pd.DataFrame:
         """Merge forecast DataFrame with actual realized values."""
         # Load full deduplicated data
-        raw_df = self.data_transformer.loader.load()
-        dedup_df = self.data_transformer.loader.deduplicate(raw_df)
+        dedup_df = self.data_transformer.loader.load()
 
         # Prepare target series
         target_series = self.data_transformer._prepare_target(dedup_df)

@@ -2,7 +2,7 @@
 
 import pandas as pd
 import numpy as np
-from typing import Tuple, Optional
+from typing import Optional
 from pathlib import Path
 from dataclasses import dataclass
 
@@ -18,6 +18,8 @@ class TransformedData:
     feature_names: list[str]
     dates: pd.DatetimeIndex
     metadata: dict
+    target_original: Optional[pd.Series] = None  # Pre-transformation target series
+    transformer: Optional['Transformer'] = None  # For inverse_standardize
 
 
 class DataLoader:
@@ -27,9 +29,17 @@ class DataLoader:
         self.data_path = data_path
         self._raw_data: Optional[pd.DataFrame] = None
 
-    def load(self) -> pd.DataFrame:
-        """Load raw data from parquet."""
+    def load(self, deduplicate: bool = True) -> pd.DataFrame:
+        """Load data from parquet, deduplicated by default.
+
+        Args:
+            deduplicate: If True (default), deduplicate by keeping the latest
+                valid_to for each (value_date, series). Set to False to return
+                the raw data.
+        """
         df = pd.read_parquet(self.data_path)
+        if deduplicate:
+            df = self.deduplicate(df)
         return df
 
     def deduplicate(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -136,28 +146,75 @@ class FrequencyInferrer:
 class Transformer:
     """Apply transformations to time series."""
 
-    @staticmethod
+    def __init__(self, standardize: bool = True):
+        self.standardize = standardize
+        self._std_params: dict[str, dict[str, float]] = {}
+
     def apply_transformation(
+        self,
         series: pd.Series,
-        transformation: str
+        transformation: str,
+        series_name: Optional[str] = None,
     ) -> pd.Series:
         """
-        Apply specified transformation.
+        Apply specified transformation, then optionally standardize to mean 0, std 1.
 
-        Returns: Transformed series (may be shorter due to differencing)
+        Args:
+            series: Input time series.
+            transformation: One of 'none', 'log', 'diff', '12m_diff', 'log_diff', 'log_12m_diff'.
+            series_name: Key used to store standardization params for later
+                inversion. If None, standardization params are stored under the
+                transformation name.
+
+        Returns: Transformed (and possibly standardized) series.
         """
         if transformation == 'none':
-            return series
+            result = series
         elif transformation == 'log':
-            return np.log(series)
+            result = np.log(series)
         elif transformation == 'diff':
-            return series.diff()
+            result = series.diff()
         elif transformation == '12m_diff':
-            return series.diff(12)
+            result = series.diff(12)
         elif transformation == 'log_diff':
-            return np.log(series).diff()
+            result = np.log(series).diff()
+        elif transformation == 'log_12m_diff':
+            result = np.log(series).diff(12)
         else:
             raise ValueError(f"Unknown transformation: {transformation}")
+
+        if self.standardize:
+            key = series_name if series_name is not None else transformation
+            mean = result.mean()
+            std = result.std()
+            if std == 0 or np.isnan(std):
+                std = 1.0
+            self._std_params[key] = {'mean': mean, 'std': std}
+            result = (result - mean) / std
+
+        return result
+
+    def inverse_standardize(
+        self,
+        series: pd.Series,
+        series_name: Optional[str] = None,
+        transformation: Optional[str] = None,
+    ) -> pd.Series:
+        """
+        Reverse standardization applied during apply_transformation.
+
+        Args:
+            series: Standardized series.
+            series_name: Key used when apply_transformation was called.
+            transformation: Fallback key (used when series_name is None).
+
+        Returns: Series in the pre-standardized (but still transformed) scale.
+        """
+        key = series_name if series_name is not None else transformation
+        if key is None or key not in self._std_params:
+            return series
+        params = self._std_params[key]
+        return series * params['std'] + params['mean']
 
     @staticmethod
     def inverse_transformation(
@@ -194,87 +251,19 @@ class Transformer:
                 raise ValueError("Need original series for log_diff inversion")
             log_level = series.cumsum() + np.log(original_series.iloc[0])
             return np.exp(log_level)
+        elif transformation == 'log_12m_diff':
+            if original_series is None:
+                raise ValueError("Need original series for log_12m_diff inversion")
+            log_original = np.log(original_series)
+            log_result = series.copy()
+            for i in range(len(log_result)):
+                if i < 12:
+                    log_result.iloc[i] = log_original.iloc[i] + series.iloc[i]
+                else:
+                    log_result.iloc[i] = log_result.iloc[i-12] + series.iloc[i]
+            return np.exp(log_result)
         else:
             raise ValueError(f"Unknown transformation: {transformation}")
-
-
-class TrendRemover:
-    """Handle trend extraction for BART (which cannot extrapolate trends)."""
-
-    def __init__(self, method: str = 'linear'):
-        self.method = method
-        self.trend_params = {}
-
-    def fit_trend(self, y: pd.Series) -> pd.Series:
-        """
-        Fit trend to series and return trend component.
-        """
-        if self.method == 'linear':
-            # Fit linear trend
-            t = np.arange(len(y))
-            coeffs = np.polyfit(t, y.values, deg=1)
-            self.trend_params = {'slope': coeffs[0], 'intercept': coeffs[1], 'length': len(y)}
-            trend = coeffs[0] * t + coeffs[1]
-            return pd.Series(trend, index=y.index)
-
-        elif self.method == 'hp_filter':
-            # Hodrick-Prescott filter
-            try:
-                from statsmodels.tsa.filters.hp_filter import hpfilter
-                cycle, trend = hpfilter(y, lamb=129600)  # Monthly lambda
-                self.trend_params = {'trend_series': trend}
-                return trend
-            except ImportError:
-                raise ImportError("statsmodels required for hp_filter method")
-
-        elif self.method == 'moving_average':
-            # Centered moving average
-            window = 24  # 2-year window for monthly data
-            trend = y.rolling(window=window, center=True).mean()
-            # Fill edges with simple trend
-            trend = trend.bfill().ffill()
-            self.trend_params = {'trend_series': trend}
-            return trend
-
-        else:
-            raise ValueError(f"Unknown detrend method: {self.method}")
-
-    def remove_trend(self, y: pd.Series) -> Tuple[pd.Series, pd.Series]:
-        """
-        Remove trend from series.
-
-        Returns: (detrended_series, trend_component)
-        """
-        trend = self.fit_trend(y)
-        detrended = y - trend
-        return detrended, trend
-
-    def extrapolate_trend(self, n_periods: int) -> np.ndarray:
-        """
-        Extrapolate trend for forecast horizons.
-
-        Args:
-            n_periods: Number of periods to extrapolate
-
-        Returns: Array of length n_periods with trend values
-        """
-        if self.method == 'linear':
-            # Linear extrapolation is straightforward
-            last_t = self.trend_params.get('length', 0)
-            future_t = np.arange(last_t, last_t + n_periods)
-            trend = (
-                self.trend_params['slope'] * future_t +
-                self.trend_params['intercept']
-            )
-            return trend
-
-        elif self.method in ['hp_filter', 'moving_average']:
-            # Extrapolate last trend value (assumes trend persists)
-            last_trend = self.trend_params['trend_series'].iloc[-1]
-            return np.full(n_periods, last_trend)
-
-        else:
-            raise ValueError(f"Unknown detrend method: {self.method}")
 
 
 class LagFeatureBuilder:
@@ -326,10 +315,6 @@ class DataTransformer:
         self.loader = DataLoader(data_path)
         self.freq_inferrer = FrequencyInferrer()
         self.transformer = Transformer()
-        self.trend_remover = None
-
-        if config.target.detrend:
-            self.trend_remover = TrendRemover(config.target.detrend_method)
 
     def prepare_data(
         self,
@@ -345,15 +330,15 @@ class DataTransformer:
 
         Returns: TransformedData with X, y arrays ready for BART
         """
-        # 1. Load and deduplicate
-        raw_df = self.loader.load()
-
+        # 1. Load data
         if as_of_date:
+            raw_df = self.loader.load(deduplicate=False)
             df = self.loader.create_vintage(raw_df, as_of_date)
         else:
-            df = self.loader.deduplicate(raw_df)
+            df = self.loader.load()
 
-        # 2. Prepare target variable
+        # 2. Prepare target variable (keep original before transformation)
+        target_original = self._extract_target_series(df)
         target_series = self._prepare_target(df)
 
         # 3. Prepare feature variables
@@ -384,11 +369,30 @@ class DataTransformer:
                 'as_of_date': as_of_date,
                 'n_samples': len(X),
                 'n_features': X.shape[1]
-            }
+            },
+            target_original=target_original,
+            transformer=self.transformer
         )
 
+    def _extract_target_series(self, df: pd.DataFrame) -> pd.Series:
+        """Extract target series at monthly frequency, before any transformation."""
+        target_spec = self.config.target
+        target_df = df[
+            df['internal_series_name'] == target_spec.internal_series_name
+        ].copy()
+
+        if len(target_df) == 0:
+            raise ValueError(f"Target series '{target_spec.internal_series_name}' not found in data")
+
+        freq = self.freq_inferrer.infer_frequency(target_df['value_date'])
+        if freq != 'M':
+            target_df = self.freq_inferrer.aggregate_to_monthly(target_df, method='last')
+            return target_df['value'].sort_index()
+        else:
+            return target_df.set_index('value_date')['value'].sort_index()
+
     def _prepare_target(self, df: pd.DataFrame) -> pd.Series:
-        """Prepare target variable with transformations and optional detrending."""
+        """Prepare target variable with transformations."""
         target_spec = self.config.target
 
         # Filter to target series
@@ -412,12 +416,9 @@ class DataTransformer:
 
         # Apply transformation
         target_series = self.transformer.apply_transformation(
-            target_series, target_spec.transformation
+            target_series, target_spec.transformation,
+            series_name=target_spec.internal_series_name
         )
-
-        # Detrend if specified
-        if target_spec.detrend and self.trend_remover:
-            target_series, _ = self.trend_remover.remove_trend(target_series)
 
         return target_series
 
@@ -452,7 +453,8 @@ class DataTransformer:
 
             # Apply transformation
             feat_series = self.transformer.apply_transformation(
-                feat_series, feat_spec.transformation
+                feat_series, feat_spec.transformation,
+                series_name=feat_spec.internal_series_name
             )
 
             # Handle missing values if specified

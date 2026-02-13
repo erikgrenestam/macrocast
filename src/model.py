@@ -2,9 +2,11 @@
 
 import pymc as pm
 import pymc_bart as pmb
+import arviz as az
 import numpy as np
 import pandas as pd
 import pickle
+import matplotlib.pyplot as plt
 from pathlib import Path
 from typing import Optional, Dict, Tuple
 from dataclasses import dataclass
@@ -80,6 +82,10 @@ class BARTForecaster:
                 random_seed=42
             )
 
+            # Generate in-sample posterior predictive
+            print(f"  Generating in-sample posterior predictive...")
+            ppc = pm.sample_posterior_predictive(idata, random_seed=42)
+
         # Store model artifacts
         self.models[horizon] = (model, idata)
 
@@ -88,6 +94,24 @@ class BARTForecaster:
         summary = pm.summary(idata, var_names=['sigma'])
         print(f"  Sigma: mean={summary['mean'].values[0]:.4f}, "
               f"r_hat={summary['r_hat'].values[0]:.4f}")
+
+        # Print in-sample fit summary
+        ppc_mean = ppc.posterior_predictive['y_obs'].mean(dim=('chain', 'draw')).values
+        rmse = np.sqrt(np.mean((ppc_mean - y) ** 2))
+        print(f"  In-sample RMSE: {rmse:.4f}")
+
+        # Plot posterior predictive check
+        log_dir = Path("logs")
+        log_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+        plot_path = log_dir / f"ppc_horizon{horizon}_{timestamp}.png"
+
+        ax = az.plot_ppc(ppc, num_pp_samples=100)
+        ax.set_title(f"Posterior Predictive Check (h={horizon})")
+        plt.tight_layout()
+        plt.savefig(plot_path, dpi=150)
+        plt.show()
+        print(f"  PPC plot saved to {plot_path}")
 
         # Compute variable importance (simplified)
         if feature_names:
@@ -101,7 +125,8 @@ class BARTForecaster:
         return_samples: bool = False
     ) -> Tuple:
         """
-        Generate predictions for new data.
+        Generate out-of-sample predictions using pm.set_data and
+        pm.sample_posterior_predictive.
 
         Args:
             X_new: Feature matrix for prediction (n_samples, n_features)
@@ -111,35 +136,20 @@ class BARTForecaster:
         Returns:
             (point_forecast, lower_bound, upper_bound)
             If return_samples=True, also returns samples array
-
-        Note: This is a simplified MVP implementation. For production, proper BART
-        out-of-sample prediction should use the fitted tree structure with new X.
         """
         if horizon not in self.models:
             raise ValueError(f"No trained model for horizon {horizon}")
 
         model, idata = self.models[horizon]
 
-        # Extract posterior predictions from training
-        # For MVP: use posterior statistics from the model
-        mu_posterior = idata.posterior['mu'].values  # (chains, draws, n_train)
-        sigma_posterior = idata.posterior['sigma'].values  # (chains, draws)
+        with model:
+            pm.set_data({'X': X_new})
+            ppc = pm.sample_posterior_predictive(idata, random_seed=42)
 
-        # Flatten chains and draws
-        mu_flat = mu_posterior.reshape(-1, mu_posterior.shape[-1])  # (total_samples, n_train)
-        sigma_flat = sigma_posterior.flatten()  # (total_samples,)
-
-        # Use the mean prediction from training as baseline
-        # This is a simplified approach for MVP
-        baseline_prediction = mu_flat.mean()
-
-        # Generate prediction samples by sampling from Normal(baseline, sigma)
-        n_posterior_samples = len(sigma_flat)
-        y_pred_samples = np.random.normal(
-            baseline_prediction,
-            sigma_flat[:, np.newaxis],
-            size=(n_posterior_samples, X_new.shape[0])
-        )
+        # y_obs shape: (chain, draw, n_obs)
+        y_pred_samples = ppc.posterior_predictive['y_obs'].values
+        # Flatten chains and draws -> (total_samples, n_obs)
+        y_pred_samples = y_pred_samples.reshape(-1, X_new.shape[0])
 
         # Compute statistics
         point_forecast = y_pred_samples.mean(axis=0)
@@ -260,8 +270,6 @@ class BARTForecaster:
             path: Directory containing saved models
             horizon: If specified, load only this horizon. Else load all.
         """
-        import arviz as az
-
         path = Path(path)
 
         if horizon:
@@ -292,6 +300,36 @@ class BARTForecaster:
                 self.variable_importance[h] = pd.read_csv(var_imp_path)
 
         print(f"Loaded {len(horizons_to_load)} models from {path}")
+
+
+class BayesianForecaster:
+    """Univariate Bayesian forecaster for a single time series."""
+
+    def __init__(self, horizon: int = 1):
+        self.horizon = horizon
+        self.model = None
+        self.idata = None
+
+    def train(self, y: np.ndarray) -> None:
+        """
+        Train the univariate Bayesian model.
+
+        Args:
+            y: Time series array (n_observations,)
+        """
+        raise NotImplementedError
+
+    def predict(self, steps: int = 1) -> Tuple:
+        """
+        Generate forecasts from the trained model.
+
+        Args:
+            steps: Number of steps ahead to forecast
+
+        Returns:
+            (point_forecast, lower_bound, upper_bound)
+        """
+        raise NotImplementedError
 
 
 class ProductionForecaster:
