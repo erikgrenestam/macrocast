@@ -7,6 +7,7 @@ from pathlib import Path
 from dataclasses import dataclass
 
 from config import ModelConfig, VariableSpec
+from load_data import load_parquet, create_vintage
 
 
 @dataclass
@@ -20,71 +21,6 @@ class TransformedData:
     metadata: dict
     target_original: Optional[pd.Series] = None  # Pre-transformation target series
     transformer: Optional['Transformer'] = None  # For inverse_standardize
-
-
-class DataLoader:
-    """Load and deduplicate raw parquet data."""
-
-    def __init__(self, data_path: Path):
-        self.data_path = data_path
-        self._raw_data: Optional[pd.DataFrame] = None
-
-    def load(self, deduplicate: bool = True) -> pd.DataFrame:
-        """Load data from parquet, deduplicated by default.
-
-        Args:
-            deduplicate: If True (default), deduplicate by keeping the latest
-                valid_to for each (value_date, series). Set to False to return
-                the raw data.
-        """
-        df = pd.read_parquet(self.data_path)
-        if deduplicate:
-            df = self.deduplicate(df)
-        return df
-
-    def deduplicate(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Deduplicate by keeping latest valid_to for each (value_date, series).
-
-        For series without vintage data (valid_to is NaT), keep all records.
-        """
-        df = df.copy()
-        df['valid_to_sort'] = df['valid_to'].fillna(pd.Timestamp('2200-12-31'))
-
-        # Sort and keep last (latest vintage)
-        df = df.sort_values('valid_to_sort')
-        df_dedup = df.drop_duplicates(
-            subset=['value_date', 'internal_series_name'],
-            keep='last'
-        )
-
-        return df_dedup.drop(columns=['valid_to_sort'])
-
-    def create_vintage(
-        self,
-        df: pd.DataFrame,
-        as_of_date: pd.Timestamp
-    ) -> pd.DataFrame:
-        """
-        Create pseudo-vintage: data as it would have appeared on as_of_date.
-
-        For series with vintages: use data where valid_from <= as_of_date < valid_to
-        For series without vintages: use data where value_date < as_of_date
-        """
-        df = df.copy()
-
-        # Series with vintage tracking
-        has_vintage = df['valid_from'].notna()
-        vintage_mask = (
-            has_vintage &
-            (df['valid_from'] <= as_of_date) &
-            (df['valid_to'] > as_of_date)
-        )
-
-        # Series without vintage tracking (use simple date filter)
-        no_vintage_mask = (~has_vintage) & (df['value_date'] < as_of_date)
-
-        return df[vintage_mask | no_vintage_mask].copy()
 
 
 class FrequencyInferrer:
@@ -307,12 +243,65 @@ class LagFeatureBuilder:
         return pd.DataFrame(lag_data, index=series.index)
 
 
+COMPOSITE_SERIES = {
+    'bankruptcies': {
+        'sources': [
+            ('bankruptcies_konk3_dk_dst', '2009-01-01', None),
+            ('bankruptcies_konk2_dk_dst', '2005-01-01', '2010-01-01'),
+            ('bankruptcies_konk2x_dk_dst', '1993-01-01', '2009-01-01'),
+        ],
+    },
+}
+
+
+def resolve_composite_series(df: pd.DataFrame, composite_name: str) -> pd.DataFrame:
+    """
+    Combine multiple raw series into a single composite series.
+
+    Uses combine_first in priority order (first source takes precedence)
+    within the specified date ranges.
+
+    Returns rows in the same long format with internal_series_name set
+    to composite_name.
+    """
+    spec = COMPOSITE_SERIES[composite_name]
+    resolved = None
+
+    for series_name, start, end in spec['sources']:
+        subset = df[df['internal_series_name'] == series_name].copy()
+        if subset.empty:
+            continue
+
+        subset = subset.set_index('value_date')[['value']].sort_index()
+        subset = subset.loc[start:end]
+
+        if resolved is None:
+            resolved = subset
+        else:
+            resolved = resolved.combine_first(subset)
+
+    if resolved is None:
+        raise ValueError(
+            f"No data found for composite series '{composite_name}'. "
+            f"Expected source series: {[s[0] for s in spec['sources']]}"
+        )
+
+    resolved = resolved.reset_index()
+    resolved['internal_series_name'] = composite_name
+    resolved['original_series_id'] = composite_name
+    resolved['data_source'] = 'composite'
+    resolved['valid_from'] = None
+    resolved['valid_to'] = None
+
+    return resolved
+
+
 class DataTransformer:
     """Main transformer orchestrating the full pipeline."""
 
     def __init__(self, config: ModelConfig, data_path: Path):
         self.config = config
-        self.loader = DataLoader(data_path)
+        self.data_path = data_path
         self.freq_inferrer = FrequencyInferrer()
         self.transformer = Transformer()
 
@@ -332,28 +321,31 @@ class DataTransformer:
         """
         # 1. Load data
         if as_of_date:
-            raw_df = self.loader.load(deduplicate=False)
-            df = self.loader.create_vintage(raw_df, as_of_date)
+            raw_df = load_parquet(self.data_path, deduplicate=False)
+            df = create_vintage(raw_df, as_of_date)
         else:
-            df = self.loader.load()
+            df = load_parquet(self.data_path)
 
-        # 2. Prepare target variable (keep original before transformation)
+        # 2. Resolve composite series (e.g. "bankruptcies" -> konk2/2x/3)
+        df = self._resolve_composites(df)
+
+        # 3. Prepare target variable (keep original before transformation)
         target_original = self._extract_target_series(df)
         target_series = self._prepare_target(df)
 
-        # 3. Prepare feature variables
+        # 4. Prepare feature variables
         feature_df = self._prepare_features(df, horizon)
 
-        # 4. Align target with features (handle forecast horizon)
+        # 5. Align target with features (handle forecast horizon)
         y_aligned = target_series.shift(-horizon)
 
-        # 5. Merge and remove NaNs
+        # 6. Merge and remove NaNs
         full_df = feature_df.copy()
         full_df['target'] = y_aligned
 
         full_df = full_df.dropna()
 
-        # 6. Extract arrays
+        # 7. Extract arrays
         X = full_df.drop(columns=['target']).values
         y = full_df['target'].values
         feature_names = full_df.drop(columns=['target']).columns.tolist()
@@ -373,6 +365,18 @@ class DataTransformer:
             target_original=target_original,
             transformer=self.transformer
         )
+
+    def _resolve_composites(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Resolve any composite series referenced by the spec."""
+        all_names = {self.config.target.internal_series_name}
+        all_names.update(f.internal_series_name for f in self.config.features)
+
+        for name in all_names:
+            if name in COMPOSITE_SERIES:
+                composite_df = resolve_composite_series(df, name)
+                df = pd.concat([df, composite_df], ignore_index=True)
+
+        return df
 
     def _extract_target_series(self, df: pd.DataFrame) -> pd.Series:
         """Extract target series at monthly frequency, before any transformation."""
