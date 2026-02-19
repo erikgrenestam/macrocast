@@ -1,14 +1,14 @@
-"""Backtesting and evaluation for BART forecasting models."""
+"""Backtesting and evaluation for forecasting models."""
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Type
 from dataclasses import dataclass
 
 from config import ModelConfig
-from model import BARTForecaster, ForecastResult
+from model import Forecaster
 from transform import DataTransformer
 
 
@@ -28,10 +28,13 @@ class BacktestEngine:
     def __init__(
         self,
         config: ModelConfig,
-        data_path: Path
+        forecaster_cls: Type[Forecaster],
+        forecaster_kwargs: Optional[Dict[str, Any]] = None,
     ):
         self.config = config
-        self.data_transformer = DataTransformer(config, data_path)
+        self.data_transformer = DataTransformer(config)
+        self.forecaster_cls = forecaster_cls
+        self.forecaster_kwargs = forecaster_kwargs or {}
         self.results: Optional[BacktestResult] = None
 
     def run_backtest(self) -> BacktestResult:
@@ -117,8 +120,8 @@ class BacktestEngine:
         """
         forecasts = []
 
-        # Create forecaster for this date
-        forecaster = BARTForecaster(self.config)
+        # Create a fresh forecaster for this date
+        forecaster = self.forecaster_cls(**self.forecaster_kwargs)
 
         for horizon in self.config.model.horizons:
             print(f"  Horizon {horizon}...", end=" ", flush=True)
@@ -130,24 +133,30 @@ class BacktestEngine:
                     as_of_date=forecast_date
                 )
 
-                if len(data.X) < self.config.backtest.initial_window:
-                    print(f"insufficient data (need {self.config.backtest.initial_window}, have {len(data.X)})")
+                n_obs = len(data.y)
+                if n_obs < self.config.backtest.initial_window:
+                    print(f"insufficient data (need {self.config.backtest.initial_window}, have {n_obs})")
                     continue
+
+                # Determine if we have features
+                has_features = data.X is not None and data.X.shape[1] > 0
 
                 # Determine training window
                 train_X, train_y = self._get_training_window(data, iteration)
 
-                # Train BART model
+                # Train model
                 forecaster.train(
-                    X=train_X,
                     y=train_y,
+                    X=train_X if has_features else None,
                     horizon=horizon,
-                    feature_names=None  # Skip variable importance for speed
                 )
 
-                # Generate forecast for latest observation
-                X_latest = data.X[-1:, :]
-                point_fc, lower, upper = forecaster.predict(X_latest, horizon=horizon)
+                # Generate forecast
+                X_latest = data.X[-1:, :] if has_features else None
+                point_fc, lower, upper = forecaster.predict(
+                    horizon=horizon,
+                    X=X_latest,
+                )
 
                 # Store forecast
                 forecasts.append({
@@ -216,8 +225,9 @@ class BacktestEngine:
 
     def _merge_actuals(self, forecasts_df: pd.DataFrame) -> pd.DataFrame:
         """Merge forecast DataFrame with actual realized values."""
-        # Load full deduplicated data
-        dedup_df = self.data_transformer.loader.load()
+        # Fetch latest deduplicated data
+        from load_data import get_vintage
+        dedup_df = get_vintage(deduplicate=True)
 
         # Prepare target series
         target_series = self.data_transformer._prepare_target(dedup_df)

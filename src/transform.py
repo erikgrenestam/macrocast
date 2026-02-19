@@ -3,11 +3,10 @@
 import pandas as pd
 import numpy as np
 from typing import Optional
-from pathlib import Path
 from dataclasses import dataclass
 
 from config import ModelConfig, VariableSpec
-from load_data import load_parquet, create_vintage
+from load_data import get_vintage
 
 
 @dataclass
@@ -299,9 +298,8 @@ def resolve_composite_series(df: pd.DataFrame, composite_name: str) -> pd.DataFr
 class DataTransformer:
     """Main transformer orchestrating the full pipeline."""
 
-    def __init__(self, config: ModelConfig, data_path: Path):
+    def __init__(self, config: ModelConfig):
         self.config = config
-        self.data_path = data_path
         self.freq_inferrer = FrequencyInferrer()
         self.transformer = Transformer()
 
@@ -320,11 +318,7 @@ class DataTransformer:
         Returns: TransformedData with X, y arrays ready for BART
         """
         # 1. Load data
-        if as_of_date:
-            raw_df = load_parquet(self.data_path, deduplicate=False)
-            df = create_vintage(raw_df, as_of_date)
-        else:
-            df = load_parquet(self.data_path)
+        df = get_vintage(as_of_date=as_of_date, deduplicate=True)
 
         # 2. Resolve composite series (e.g. "bankruptcies" -> konk2/2x/3)
         df = self._resolve_composites(df)
@@ -340,15 +334,21 @@ class DataTransformer:
         y_aligned = target_series.shift(-horizon)
 
         # 6. Merge and remove NaNs
-        full_df = feature_df.copy()
-        full_df['target'] = y_aligned
-
-        full_df = full_df.dropna()
+        if len(feature_df.columns) > 0:
+            full_df = feature_df.copy()
+            full_df['target'] = y_aligned
+            full_df = full_df.dropna()
+            X = full_df.drop(columns=['target']).values
+            feature_names = full_df.drop(columns=['target']).columns.tolist()
+        else:
+            # Univariate: no features, just target
+            full_df = pd.DataFrame({'target': y_aligned})
+            full_df = full_df.dropna()
+            X = np.empty((len(full_df), 0))
+            feature_names = []
 
         # 7. Extract arrays
-        X = full_df.drop(columns=['target']).values
         y = full_df['target'].values
-        feature_names = full_df.drop(columns=['target']).columns.tolist()
         dates = full_df.index
 
         return TransformedData(

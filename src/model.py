@@ -1,4 +1,4 @@
-"""BART model training and forecasting."""
+"""Model training and forecasting."""
 
 import pymc as pm
 import pymc_bart as pmb
@@ -8,7 +8,7 @@ import pandas as pd
 import pickle
 import matplotlib.pyplot as plt
 from pathlib import Path
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Protocol, Tuple, runtime_checkable
 from dataclasses import dataclass
 
 from config import ModelConfig
@@ -27,6 +27,19 @@ class ForecastResult:
     forecast_date: pd.Timestamp
 
 
+@runtime_checkable
+class Forecaster(Protocol):
+    """Protocol for forecasters compatible with BacktestEngine.
+
+    Implementations must support:
+    - train(y, X=None): X is optional for univariate models
+    - predict(horizon, X=None): returns (point_forecast, lower_bound, upper_bound)
+    """
+
+    def train(self, y: np.ndarray, X: np.ndarray | None = None, **kwargs) -> None: ...
+    def predict(self, horizon: int, X: np.ndarray | None = None, **kwargs) -> tuple[np.ndarray, np.ndarray, np.ndarray]: ...
+
+
 class BARTForecaster:
     """BART-based forecaster using direct multi-step strategy."""
 
@@ -37,20 +50,23 @@ class BARTForecaster:
 
     def train(
         self,
-        X: np.ndarray,
         y: np.ndarray,
-        horizon: int,
+        X: np.ndarray | None = None,
+        *,
+        horizon: int = 1,
         feature_names: Optional[list[str]] = None
     ) -> None:
         """
         Train BART model for a specific forecast horizon.
 
         Args:
-            X: Feature matrix (n_samples, n_features)
             y: Target vector (n_samples,)
+            X: Feature matrix (n_samples, n_features)
             horizon: Forecast horizon this model is for
             feature_names: Names of features (for variable importance)
         """
+        if X is None:
+            raise ValueError("BARTForecaster requires features (X). Use a univariate model for y-only forecasting.")
         print(f"\nTraining BART model for h={horizon}...")
         print(f"  Data shape: X={X.shape}, y={y.shape}")
 
@@ -120,8 +136,9 @@ class BARTForecaster:
 
     def predict(
         self,
-        X_new: np.ndarray,
         horizon: int,
+        X: np.ndarray | None = None,
+        *,
         return_samples: bool = False
     ) -> Tuple:
         """
@@ -129,27 +146,29 @@ class BARTForecaster:
         pm.sample_posterior_predictive.
 
         Args:
-            X_new: Feature matrix for prediction (n_samples, n_features)
             horizon: Which horizon model to use
+            X: Feature matrix for prediction (n_samples, n_features)
             return_samples: If True, return full posterior samples
 
         Returns:
             (point_forecast, lower_bound, upper_bound)
             If return_samples=True, also returns samples array
         """
+        if X is None:
+            raise ValueError("BARTForecaster requires features (X) for prediction.")
         if horizon not in self.models:
             raise ValueError(f"No trained model for horizon {horizon}")
 
         model, idata = self.models[horizon]
 
         with model:
-            pm.set_data({'X': X_new})
+            pm.set_data({'X': X})
             ppc = pm.sample_posterior_predictive(idata, random_seed=42)
 
         # y_obs shape: (chain, draw, n_obs)
         y_pred_samples = ppc.posterior_predictive['y_obs'].values
         # Flatten chains and draws -> (total_samples, n_obs)
-        y_pred_samples = y_pred_samples.reshape(-1, X_new.shape[0])
+        y_pred_samples = y_pred_samples.reshape(-1, X.shape[0])
 
         # Compute statistics
         point_forecast = y_pred_samples.mean(axis=0)
@@ -184,8 +203,8 @@ class BARTForecaster:
 
         for h in horizons:
             pt, lb, ub, samples = self.predict(
-                X_latest.reshape(1, -1),
                 horizon=h,
+                X=X_latest.reshape(1, -1),
                 return_samples=True
             )
             point_forecasts.append(pt[0])
@@ -360,8 +379,8 @@ class ProductionForecaster:
 
             # Train BART model
             self.forecaster.train(
-                X=data.X,
                 y=data.y,
+                X=data.X,
                 horizon=horizon,
                 feature_names=data.feature_names
             )

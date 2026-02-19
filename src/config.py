@@ -55,9 +55,9 @@ class ModelConfig:
     """Complete model configuration."""
 
     target: TargetSpec
-    features: list[VariableSpec]
-    model: ModelSpec
-    backtest: BacktestSpec
+    features: list[VariableSpec] = field(default_factory=list)
+    model: ModelSpec = field(default_factory=ModelSpec)
+    backtest: BacktestSpec = field(default_factory=BacktestSpec)
 
     @classmethod
     def from_yaml(cls, path: Path) -> 'ModelConfig':
@@ -66,7 +66,7 @@ class ModelConfig:
             data = yaml.safe_load(f)
 
         target = TargetSpec(**data['target'])
-        features = [VariableSpec(**v) for v in data['features']]
+        features = [VariableSpec(**v) for v in data.get('features', [])]
         model = ModelSpec(**data.get('model', {}))
         backtest = BacktestSpec(**data.get('backtest', {}))
 
@@ -74,24 +74,29 @@ class ModelConfig:
 
     def validate(self) -> None:
         """Validate configuration consistency."""
-        # Ensure target is not in features
-        feature_names = {f.internal_series_name for f in self.features}
-        if self.target.internal_series_name in feature_names:
-            raise ValueError("Target cannot be in feature list")
+        if self.features:
+            # Ensure target is not in features
+            feature_names = {f.internal_series_name for f in self.features}
+            if self.target.internal_series_name in feature_names:
+                raise ValueError("Target cannot be in feature list")
 
-        # Validate that first lag + n_lags is reasonable
-        # first_lag = horizon + publication_lag
-        # We need at least first_lag + n_lags historical periods
-        if len(self.model.horizons) > 0:
-            max_horizon = max(self.model.horizons)
-            for feature in self.features:
-                max_lag_needed = max_horizon + feature.publication_lag + feature.n_lags - 1
-                if max_lag_needed > 240:  # Warn if need more than 20 years of data
-                    import warnings
-                    warnings.warn(
-                        f"Feature {feature.internal_series_name} requires lag {max_lag_needed} "
-                        f"for horizon {max_horizon}, which may exceed available data."
-                    )
+            # Validate that first lag + n_lags is reasonable
+            # first_lag = horizon + publication_lag
+            # We need at least first_lag + n_lags historical periods
+            if len(self.model.horizons) > 0:
+                max_horizon = max(self.model.horizons)
+                for feature in self.features:
+                    max_lag_needed = max_horizon + feature.publication_lag + feature.n_lags - 1
+                    if max_lag_needed > 240:  # Warn if need more than 20 years of data
+                        import warnings
+                        warnings.warn(
+                            f"Feature {feature.internal_series_name} requires lag {max_lag_needed} "
+                            f"for horizon {max_horizon}, which may exceed available data."
+                        )
+
+            # Validate n_lags are positive for all features
+            if any(f.n_lags <= 0 for f in self.features):
+                raise ValueError("All n_lags must be positive integers")
 
         # Validate backtest method
         if self.backtest.method == 'rolling' and self.backtest.rolling_window is None:
@@ -100,7 +105,3 @@ class ModelConfig:
         # Validate horizons are positive
         if any(h <= 0 for h in self.model.horizons):
             raise ValueError("All horizons must be positive integers")
-
-        # Validate n_lags are positive for all features
-        if any(f.n_lags <= 0 for f in self.features):
-            raise ValueError("All n_lags must be positive integers")

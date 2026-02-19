@@ -5,11 +5,11 @@ import sys
 from pathlib import Path
 
 # Add src to path
-sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
+sys.path.append('src')
 
 from config import ModelConfig
-from eval import BacktestEngine, BacktestVisualizer
-from utils import setup_logging, ensure_dir
+from evaluate import BacktestEngine, BacktestVisualizer
+from model import BARTForecaster
 
 
 def main():
@@ -22,12 +22,6 @@ def main():
         type=Path,
         required=True,
         help='Path to spec.yaml configuration file'
-    )
-    parser.add_argument(
-        '--data',
-        type=Path,
-        required=True,
-        help='Path to input parquet data file'
     )
     parser.add_argument(
         '--output',
@@ -65,7 +59,11 @@ def main():
 
     # Run backtest
     logger.info("Starting backtest...")
-    engine = BacktestEngine(config, args.data)
+    engine = BacktestEngine(
+        config=config,
+        forecaster_cls=BARTForecaster,
+        forecaster_kwargs={'config': config},
+    )
     results = engine.run_backtest()
 
     # Save results
